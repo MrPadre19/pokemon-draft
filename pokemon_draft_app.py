@@ -234,14 +234,31 @@ pokemon_types = [
 
 for i in range(3):
     p = st.session_state.players[i]
-    p["name"] = st.sidebar.text_input(f"Player {i + 1} name", value=p["name"])
+
+    # Give the name field a stable key too (optional but nice)
+    name_key = f"player_{i}_name"
+    p["name"] = st.sidebar.text_input(
+        f"Player {i + 1} name",
+        value=p["name"],
+        key=name_key,
+    )
+
+    # Stable key for this player's type selection
+    types_key = f"player_{i}_types"
+
+    # Initialize the state for this key once if it's not there yet
+    if types_key not in st.session_state:
+        st.session_state[types_key] = p["types"] or []
 
     selected = st.sidebar.multiselect(
         f"{p['name']}: Choose 3 Pokémon types",
         pokemon_types,
-        default=p["types"] if p["types"] else []
+        key=types_key,
     )
+
+    # Keep our own player record in sync with the widget value
     p["types"] = selected
+
 
 if st.sidebar.button("Reset entire draft (all players & counts)"):
     st.session_state.clear()
