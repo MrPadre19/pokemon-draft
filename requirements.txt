@@ -2,3 +2,4 @@ streamlit==1.12.0
 pandas
 pillow
 requests
+altair==4.2.2
