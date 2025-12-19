@@ -5,12 +5,165 @@ import math
 from io import BytesIO
 from PIL import Image
 import requests
+import json
+import gspread
+from google.oauth2.service_account import Credentials
+from datetime import datetime, timezone
+import time
 
 # ---------- CONFIG ----------
 CSV_NAME = "Pokemon Collection - Miles (English).csv"
 IMAGE_FOLDER = "card_images"  # folder next to this .py file
 
 os.makedirs(IMAGE_FOLDER, exist_ok=True)
+
+# ---------- GOOGLE SHEETS HELPERS ----------
+
+SCOPES = ["https://www.googleapis.com/auth/spreadsheets"]
+
+def load_service_account_info():
+    """
+    Try to load service account info from Streamlit secrets (for cloud),
+    otherwise fall back to a local JSON file (for local testing).
+    """
+    # Try Streamlit secrets first (used on Streamlit Cloud)
+    try:
+        raw = st.secrets.get("gcp_service_account", None)
+        if raw:
+            return json.loads(raw)
+    except Exception:
+        pass
+
+    # Local JSON file fallback
+    json_path = os.path.join(os.path.dirname(__file__), "gcp_service_account.json")
+    with open(json_path, "r") as f:
+        return json.load(f)
+
+def get_gsheet_client():
+    try:
+        service_account_info = load_service_account_info()
+        credentials = Credentials.from_service_account_info(
+            service_account_info,
+            scopes=SCOPES,
+        )
+        client = gspread.authorize(credentials)
+        return client
+    except Exception as e:
+        st.warning(f"Could not connect to Google Sheets (drafts will not be logged): {e}")
+        return None
+
+def get_draft_sheet():
+    client = get_gsheet_client()
+    if client is None:
+        return None, None, None
+
+    # Try to get sheet ID from secrets first, otherwise use hardcoded value
+    sheet_id = None
+    try:
+        sheet_id = st.secrets.get("google_sheets_document_id", None)
+    except Exception:
+        sheet_id = None
+
+    if sheet_id is None:
+        # Fallback: hardcode your sheet ID here for local testing
+        sheet_id = "1OORWkcWkwixexnHElLj0BXUSw_BL840gu2zEPMXc8j8"
+
+    try:
+        sh = client.open_by_key(sheet_id)
+        drafts_ws = sh.worksheet("Drafts")
+        rounds_ws = sh.worksheet("Rounds")
+        return sh, drafts_ws, rounds_ws
+    except Exception as e:
+        st.warning(f"Could not open Google Sheet or worksheets: {e}")
+        return None, None, None
+
+def ensure_draft_row(draft_id, players):
+    """
+    Ensure a row exists in the Drafts sheet for this draft_id.
+    If it doesn't exist, create it.
+    """
+    sh, drafts_ws, rounds_ws = get_draft_sheet()
+    if drafts_ws is None:
+        return  # Sheets not configured / unavailable
+
+    try:
+        all_values = drafts_ws.get_all_values()
+        existing_ids = [row[0] for row in all_values[1:]] if len(all_values) > 1 else []
+        if draft_id in existing_ids:
+            return
+
+        timestamp = datetime.now(timezone.utc).isoformat()
+        p1 = players[0]["name"] if len(players) > 0 else ""
+        p2 = players[1]["name"] if len(players) > 1 else ""
+        p3 = players[2]["name"] if len(players) > 2 else ""
+        config_json = "{}"  # placeholder for future config
+
+        drafts_ws.append_row(
+            [draft_id, timestamp, "active", p1, p2, p3, config_json]
+        )
+    except Exception as e:
+        st.warning(f"Could not ensure draft row in Google Sheets: {e}")
+
+def append_round_offers_to_sheet(draft_id, player_name, round_num, choices):
+    """
+    Log the 3 offered cards for a round into the Rounds sheet.
+    """
+    sh, drafts_ws, rounds_ws = get_draft_sheet()
+    if rounds_ws is None:
+        return  # Sheets not configured / unavailable
+
+    try:
+        timestamp = datetime.now(timezone.utc).isoformat()
+        rows = []
+        for idx, uid in enumerate(choices, start=1):
+            rows.append([
+                str(draft_id),
+                str(player_name),
+                int(round_num),
+                int(idx),
+                str(uid),
+                "TRUE",   # offered
+                "FALSE",  # picked (not yet)
+                timestamp
+            ])
+        rounds_ws.append_rows(rows)
+    except Exception as e:
+        st.warning(f"Could not log round offers to Google Sheets: {e}")
+
+def mark_pick_in_sheet(draft_id, player_name, round_num, picked_uid):
+    """
+    Mark the chosen card as picked=TRUE in the Rounds sheet for this draft.
+    """
+    sh, drafts_ws, rounds_ws = get_draft_sheet()
+    if rounds_ws is None:
+        return  # Sheets not configured / unavailable
+
+    try:
+        all_values = rounds_ws.get_all_values()
+        if not all_values:
+            return
+
+        header = all_values[0]
+        def col_idx(col_name):
+            return header.index(col_name) + 1  # 1-based for gspread
+
+        draft_idx = col_idx("draft_id")
+        player_idx = col_idx("player_name")
+        round_idx = col_idx("round")
+        uid_idx = col_idx("unique_id")
+        picked_idx = col_idx("picked")
+
+        for row_num, row in enumerate(all_values[1:], start=2):
+            if (
+                row[draft_idx-1] == str(draft_id) and
+                row[player_idx-1] == str(player_name) and
+                row[round_idx-1] == str(round_num) and
+                row[uid_idx-1] == str(picked_uid)
+            ):
+                rounds_ws.update_cell(row_num, picked_idx, "TRUE")
+                break
+    except Exception as e:
+        st.warning(f"Could not log pick to Google Sheets: {e}")
 
 # ---------- LOAD DATA ----------
 @st.cache(show_spinner=False)
@@ -109,31 +262,6 @@ def get_card_image_source(unique_id, card_name, image_url):
     else:
         return None
 
-# ---------- HELPER: LOAD IMAGE FOR COLLAGE ----------
-def load_image_for_collage(src, target_size=(245, 342)):
-    """
-    Given a local path or URL, load the image as a PIL Image and
-    resize it to target_size. Returns None if it cannot be loaded.
-    """
-    if not src:
-        return None
-
-    try:
-        if src.startswith("http://") or src.startswith("https://"):
-            resp = requests.get(src, timeout=10)
-            if resp.status_code != 200:
-                return None
-            img = Image.open(BytesIO(resp.content)).convert("RGB")
-        else:
-            if not os.path.exists(src):
-                return None
-            img = Image.open(src).convert("RGB")
-
-        img = img.resize(target_size, Image.LANCZOS)
-        return img
-    except Exception:
-        return None
-
 # ---------- HELPER: GENERATE CHOICES FOR A ROUND ----------
 def generate_round_choices(player_index):
     player = st.session_state.players[player_index]
@@ -217,6 +345,10 @@ def generate_round_choices(player_index):
         chosen_rows = eligible.sample(3)
         choices = list(chosen_rows["Unique ID"].values)
 
+    # Log offers to Google Sheets
+    draft_id = st.session_state.get("draft_id", "LOCAL-DRAFT")
+    append_round_offers_to_sheet(draft_id, player["name"], round_num, choices)
+
     # Apply side effects: mark seen & decrement global counts
     for uid in choices:
         player["seen_ids"].add(uid)
@@ -224,7 +356,18 @@ def generate_round_choices(player_index):
 
     return choices
 
-# ---------- SIDEBAR: PLAYER SETUP ----------
+# ---------- SIDEBAR: DRAFT + PLAYER SETUP ----------
+st.sidebar.header("Draft Setup")
+
+# Draft ID (for logging to Sheets / future async)
+if "draft_id" not in st.session_state:
+    st.session_state.draft_id = f"DRAFT-{int(time.time())}"
+
+draft_id_input = st.sidebar.text_input("Draft ID", value=st.session_state.draft_id)
+draft_id = draft_id_input.strip() or st.session_state.draft_id
+st.session_state.draft_id = draft_id
+st.sidebar.write(f"Using draft ID: `{draft_id}`")
+
 st.sidebar.header("Player Setup")
 
 pokemon_types = [
@@ -235,7 +378,7 @@ pokemon_types = [
 for i in range(3):
     p = st.session_state.players[i]
 
-    # Give the name field a stable key too (optional but nice)
+    # Stable key for player name
     name_key = f"player_{i}_name"
     p["name"] = st.sidebar.text_input(
         f"Player {i + 1} name",
@@ -245,8 +388,6 @@ for i in range(3):
 
     # Stable key for this player's type selection
     types_key = f"player_{i}_types"
-
-    # Initialize the state for this key once if it's not there yet
     if types_key not in st.session_state:
         st.session_state[types_key] = p["types"] or []
 
@@ -256,9 +397,10 @@ for i in range(3):
         key=types_key,
     )
 
-    # Keep our own player record in sync with the widget value
     p["types"] = selected
 
+# Ensure this draft ID exists in the Drafts sheet (non-fatal if Sheets isn't configured)
+ensure_draft_row(draft_id, st.session_state.players)
 
 if st.sidebar.button("Reset entire draft (all players & counts)"):
     st.session_state.clear()
@@ -384,7 +526,7 @@ else:
                     break
 
             if st.button("Confirm pick for this round"):
-                # Record pick
+                # Record pick in local state
                 picked_row = cards[cards["Unique ID"] == selected_uid].iloc[0]
                 player["picked_ids"].append(selected_uid)
                 player["picks"].append({
@@ -397,6 +539,10 @@ else:
                     "Set": picked_row.get("Set", ""),
                     "Series": picked_row.get("Series", "")
                 })
+
+                # Log pick to Google Sheets (non-fatal if it fails)
+                draft_id = st.session_state.get("draft_id", "LOCAL-DRAFT")
+                mark_pick_in_sheet(draft_id, player["name"], round_num, selected_uid)
 
                 # Advance round and clear current choices
                 player["current_round"] += 1
@@ -497,8 +643,21 @@ if st.button("Generate draft image for selected player"):
             base_row = base.iloc[0]
             image_url = base_row.get("Image URL", None)
             src = get_card_image_source(uid, base_row["Card Name"], image_url)
-            img = load_image_for_collage(src, target_size=(245, 342))
+            img = None
+            if src:
+                try:
+                    if src.startswith("http://") or src.startswith("https://"):
+                        resp = requests.get(src, timeout=10)
+                        if resp.status_code == 200:
+                            img = Image.open(BytesIO(resp.content)).convert("RGB")
+                    else:
+                        if os.path.exists(src):
+                            img = Image.open(src).convert("RGB")
+                except Exception:
+                    img = None
+
             if img is not None:
+                img = img.resize((245, 342), Image.LANCZOS)
                 images.append(img)
 
         if not images:
@@ -533,3 +692,4 @@ if st.button("Generate draft image for selected player"):
                 file_name=f"{selected_player['name'].replace(' ', '_')}_draft.png",
                 mime="image/png"
             )
+
