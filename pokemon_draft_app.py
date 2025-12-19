@@ -1,10 +1,3 @@
-#### How to Run Streamlit app ####
-
-cd Desktop\pokemon_draft
-streamlit run pokemon_draft_app.py
-
-### 12.18 Update
-
 import streamlit as st
 import pandas as pd
 import os
