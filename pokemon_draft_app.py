@@ -76,6 +76,7 @@ def get_draft_sheet():
 def ensure_draft_row(draft_id, players):
     """
     Ensure a row exists in the Drafts sheet for this draft_id.
+    If it exists, update player names to match current UI.
     If it doesn't exist, create it.
     """
     sh, drafts_ws, rounds_ws = get_draft_sheet()
@@ -84,16 +85,42 @@ def ensure_draft_row(draft_id, players):
 
     try:
         all_values = drafts_ws.get_all_values()
-        existing_ids = [row[0] for row in all_values[1:]] if len(all_values) > 1 else []
-        if draft_id in existing_ids:
+        if not all_values:
             return
 
-        timestamp = datetime.now(timezone.utc).isoformat()
+        header = all_values[0]
+        rows = all_values[1:]
+        existing_ids = [row[0] for row in rows] if rows else []
+
         p1 = players[0]["name"] if len(players) > 0 else ""
         p2 = players[1]["name"] if len(players) > 1 else ""
         p3 = players[2]["name"] if len(players) > 2 else ""
         config_json = "{}"  # placeholder for future config
 
+        if draft_id in existing_ids:
+            # Update existing row's player names
+            row_index = existing_ids.index(draft_id)  # 0-based within rows
+            sheet_row_num = row_index + 2            # +2 to account for header row
+
+            # Find column indices for p1, p2, p3 if possible
+            # Expected header: [draft_id, timestamp, status, p1, p2, p3, config_json]
+            try:
+                p1_col = header.index("player1_name") + 1
+                p2_col = header.index("player2_name") + 1
+                p3_col = header.index("player3_name") + 1
+                drafts_ws.update_cell(sheet_row_num, p1_col, p1)
+                drafts_ws.update_cell(sheet_row_num, p2_col, p2)
+                drafts_ws.update_cell(sheet_row_num, p3_col, p3)
+            except ValueError:
+                # If header doesn't have named columns, fall back to hard-coded positions 4,5,6
+                drafts_ws.update_cell(sheet_row_num, 4, p1)
+                drafts_ws.update_cell(sheet_row_num, 5, p2)
+                drafts_ws.update_cell(sheet_row_num, 6, p3)
+
+            return
+
+        # No existing row -> append a new one
+        timestamp = datetime.now(timezone.utc).isoformat()
         drafts_ws.append_row(
             [draft_id, timestamp, "active", p1, p2, p3, config_json]
         )
@@ -198,7 +225,6 @@ cards = load_cards(CSV_NAME)
 # Map from string Unique ID to canonical value (to keep types consistent)
 UNIQUE_ID_MAP = {str(u): u for u in cards["Unique ID"].unique()}
 
-
 # ---------- GLOBAL STATE INITIALIZATION ----------
 if "initialized" not in st.session_state:
     st.session_state.initialized = True
@@ -218,12 +244,12 @@ if "initialized" not in st.session_state:
         st.session_state.players.append(
             {
                 "name": f"Player {i + 1}",
-                "types": [],             # list of 3 chosen Pokémon types
+                "types": [],
                 "current_round": 1,
-                "seen_ids": set(),       # Unique IDs this player has seen as options
-                "picked_ids": [],        # Unique IDs this player has drafted
-                "picks": [],             # list of dicts with card info
-                "current_choices": None, # list of 3 Unique IDs for the current round
+                "seen_ids": set(),
+                "picked_ids": [],
+                "picks": [],
+                "current_choices": None,
             }
         )
 
@@ -235,10 +261,6 @@ if "initialized" not in st.session_state:
 def get_round_info(round_num):
     """
     Returns a dict describing the rules for this round.
-    Keys:
-      - mode: "pokemon" or "trainer"
-      - rarity: one of "RR", "R", "U", "C" (for pokemon mode), or None
-      - trainer_stage: "Supporter", "Item", "Tool" (for trainer mode)
     """
     if round_num == 1:
         return {"mode": "pokemon", "rarity": "RR", "trainer_stage": None}
@@ -282,7 +304,7 @@ def get_card_image_source(unique_id, card_name, image_url):
 def load_draft_state_from_sheets(draft_id: str) -> bool:
     """
     If the given draft_id exists in Google Sheets, rebuild session state from it:
-    - Set player names from Drafts sheet
+    - Use player names observed in Rounds (what was actually used while drafting)
     - Recompute global_counts for this draft (based on offers)
     - Rebuild each player's seen_ids, picks, and current_round
     - If a round was offered but not picked yet, re-use those offers as current_choices
@@ -292,25 +314,14 @@ def load_draft_state_from_sheets(draft_id: str) -> bool:
     if drafts_ws is None or rounds_ws is None:
         return False
 
-    # ----- Look up draft row -----
+    # ----- Confirm draft exists in Drafts (by ID) -----
     draft_values = drafts_ws.get_all_values()
     if len(draft_values) < 2:
         return False  # only header, no drafts
 
-    draft_row = None
-    for row in draft_values[1:]:
-        if row and row[0] == str(draft_id):
-            draft_row = row
-            break
-
-    if draft_row is None:
-        return False  # no such draft_id yet
-
-    # Set player names from draft row: [draft_id, timestamp, status, p1, p2, p3, config_json]
-    names = draft_row[3:6]  # p1, p2, p3
-    for i in range(3):
-        name = names[i] if i < len(names) and names[i] else f"Player {i + 1}"
-        st.session_state.players[i]["name"] = name
+    draft_exists = any(row and row[0] == str(draft_id) for row in draft_values[1:])
+    if not draft_exists:
+        return False
 
     # ----- Process Rounds sheet -----
     rounds_values = rounds_ws.get_all_values()
@@ -335,7 +346,8 @@ def load_draft_state_from_sheets(draft_id: str) -> bool:
         return True
 
     relevant_rows = [
-        row for row in rounds_values[1:]
+        row
+        for row in rounds_values[1:]
         if len(row) > draft_col and row[draft_col] == str(draft_id)
     ]
 
@@ -367,13 +379,23 @@ def load_draft_state_from_sheets(draft_id: str) -> bool:
         new_global_counts[uid] = remaining
     st.session_state.global_counts = new_global_counts
 
-    # ----- Rebuild per-player info -----
+    # ----- Build per-player info from Rounds -----
     per_player = {}
+    player_order = []  # preserve first-seen order of player names
+
     for row in relevant_rows:
         if len(row) <= max(player_col, round_col, uid_col, offered_col, picked_col):
             continue
 
-        p_name = row[player_col]
+        p_name = row[player_col] or ""
+        if p_name not in per_player:
+            per_player[p_name] = {
+                "seen_ids": set(),
+                "offers": {},  # round -> list of uids
+                "picked": [],  # list of (round, uid)
+            }
+            player_order.append(p_name)
+
         round_str = row[round_col]
         uid_str = row[uid_col]
         offered_val = row[offered_col].strip().upper()
@@ -385,15 +407,7 @@ def load_draft_state_from_sheets(draft_id: str) -> bool:
             continue
 
         uid_val = UNIQUE_ID_MAP.get(uid_str, uid_str)
-
-        info = per_player.setdefault(
-            p_name,
-            {
-                "seen_ids": set(),
-                "offers": {},   # round -> list of uids
-                "picked": [],   # list of (round, uid)
-            },
-        )
+        info = per_player[p_name]
 
         if offered_val == "TRUE":
             info["seen_ids"].add(uid_val)
@@ -402,7 +416,7 @@ def load_draft_state_from_sheets(draft_id: str) -> bool:
         if picked_val == "TRUE":
             info["picked"].append((rnum, uid_val))
 
-    # Compute max picked round and "pending" (offered but not picked) round per player
+    # Compute per-player max picked round & pending round
     for p_name, info in per_player.items():
         if info["picked"]:
             max_picked_round = max(r for (r, _) in info["picked"])
@@ -412,24 +426,34 @@ def load_draft_state_from_sheets(draft_id: str) -> bool:
         pending_round = None
         for rnum in sorted(info["offers"].keys()):
             if not any(pr == rnum for (pr, _) in info["picked"]):
-                pending_round = rnum  # keep last such round
-
+                pending_round = rnum  # last offered-but-not-picked round
         info["max_picked_round"] = max_picked_round
         info["pending_round"] = pending_round
 
     # ----- Apply to session_state.players -----
-    for p_state in st.session_state.players:
-        name = p_state["name"]
-        info = per_player.get(
-            name,
-            {
+    # Map player slots in the app to the players found in Rounds, by order
+    for idx, p_state in enumerate(st.session_state.players):
+        if idx < len(player_order):
+            name = player_order[idx]
+            info = per_player.get(
+                name,
+                {
+                    "seen_ids": set(),
+                    "offers": {},
+                    "picked": [],
+                    "max_picked_round": 0,
+                    "pending_round": None,
+                },
+            )
+            p_state["name"] = name
+        else:
+            info = {
                 "seen_ids": set(),
                 "offers": {},
                 "picked": [],
                 "max_picked_round": 0,
                 "pending_round": None,
-            },
-        )
+            }
 
         # Seen IDs
         p_state["seen_ids"] = info["seen_ids"]
@@ -459,15 +483,13 @@ def load_draft_state_from_sheets(draft_id: str) -> bool:
         p_state["picks"] = picks_list
 
         # Determine current_round and current_choices
-        pending_round = info["pending_round"]
-        max_picked_round = info["max_picked_round"]
+        pending_round = info.get("pending_round")
+        max_picked_round = info.get("max_picked_round", 0)
 
         if pending_round is not None and pending_round in info["offers"]:
-            # There were offers for this round but no pick yet -> resume that round
             p_state["current_round"] = pending_round
             p_state["current_choices"] = info["offers"][pending_round]
         else:
-            # No pending round -> next round after last picked
             next_round = max_picked_round + 1 if max_picked_round > 0 else 1
             p_state["current_round"] = next_round
             p_state["current_choices"] = None
@@ -573,7 +595,7 @@ st.sidebar.header("Draft Setup")
 if "draft_id" not in st.session_state:
     st.session_state.draft_id = f"DRAFT-{int(time.time())}"
 
-draft_id_input = st.sidebar.text_input("Draft ID", value=st.session_state.draft_id)
+draft_id_input = st.sidebar.text_input("Draft ID", value=str(st.session_state.draft_id))
 draft_id = draft_id_input.strip() or st.session_state.draft_id
 st.session_state.draft_id = draft_id
 
@@ -613,7 +635,7 @@ for i in range(3):
     )
     p["types"] = selected
 
-# Ensure the draft row exists (safe if it already does)
+# Ensure the draft row exists / update names
 ensure_draft_row(draft_id, st.session_state.players)
 
 if st.sidebar.button("Reset entire draft (all players & counts)"):
