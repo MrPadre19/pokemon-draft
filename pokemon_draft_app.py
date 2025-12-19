@@ -21,8 +21,9 @@ os.makedirs(IMAGE_FOLDER, exist_ok=True)
 
 SCOPES = ["https://www.googleapis.com/auth/spreadsheets"]
 
-# Optional: local fallback sheet ID (for testing on your machine)
-LOCAL_SHEET_ID = "1OORWkcWkwixexnHElLj0BXUSw_BL840gu2zEPMXc8j8"  # or leave "" if you only want to use secrets
+# Local fallback sheet ID (used when running on your own computer).
+# Replace this string with your actual sheet ID from the Google Sheets URL.
+LOCAL_SHEET_ID = "1OORWkcWkwixexnHElLj0BXUSw_BL840gu2zEPMXc8j8"
 
 
 def load_service_account_info():
@@ -43,7 +44,7 @@ def load_service_account_info():
                 return json.loads(raw)
             except Exception:
                 pass
-        # If for some reason it's already a dict-like
+        # If for some reason it's already a dict-like, try to convert
         try:
             return dict(raw)
         except Exception:
@@ -70,7 +71,7 @@ def get_sheet_id():
         return sheet_id
 
     # Fallback for local testing
-    if LOCAL_SHEET_ID:
+    if LOCAL_SHEET_ID and LOCAL_SHEET_ID != "PUT_YOUR_SHEET_ID_HERE":
         return LOCAL_SHEET_ID
 
     # If we get here, we have no sheet ID configured
@@ -114,6 +115,103 @@ def get_draft_sheet():
         return None, None, None
 
 
+def ensure_draft_row(draft_id, players):
+    """
+    Ensure a row exists in the Drafts sheet for this draft_id.
+    If it doesn't exist, create it.
+    """
+    sh, drafts_ws, rounds_ws = get_draft_sheet()
+    if drafts_ws is None:
+        return  # Sheets not configured / unavailable
+
+    try:
+        all_values = drafts_ws.get_all_values()
+        existing_ids = [row[0] for row in all_values[1:]] if len(all_values) > 1 else []
+        if draft_id in existing_ids:
+            return
+
+        timestamp = datetime.now(timezone.utc).isoformat()
+        p1 = players[0]["name"] if len(players) > 0 else ""
+        p2 = players[1]["name"] if len(players) > 1 else ""
+        p3 = players[2]["name"] if len(players) > 2 else ""
+        config_json = "{}"  # placeholder for future config
+
+        drafts_ws.append_row(
+            [draft_id, timestamp, "active", p1, p2, p3, config_json]
+        )
+    except Exception as e:
+        if not st.session_state.get("gsheets_warning_shown", False):
+            st.session_state["gsheets_warning_shown"] = True
+            st.warning(f"Could not ensure draft row in Google Sheets: {e}")
+
+
+def append_round_offers_to_sheet(draft_id, player_name, round_num, choices):
+    """
+    Log the offered cards for a round into the Rounds sheet.
+    """
+    sh, drafts_ws, rounds_ws = get_draft_sheet()
+    if rounds_ws is None:
+        return  # Sheets not configured / unavailable
+
+    try:
+        timestamp = datetime.now(timezone.utc).isoformat()
+        rows = []
+        for idx, uid in enumerate(choices, start=1):
+            rows.append([
+                str(draft_id),
+                str(player_name),
+                int(round_num),
+                int(idx),
+                str(uid),
+                "TRUE",   # offered
+                "FALSE",  # picked (not yet)
+                timestamp
+            ])
+        rounds_ws.append_rows(rows)
+    except Exception as e:
+        if not st.session_state.get("gsheets_warning_shown", False):
+            st.session_state["gsheets_warning_shown"] = True
+            st.warning(f"Could not log round offers to Google Sheets: {e}")
+
+
+def mark_pick_in_sheet(draft_id, player_name, round_num, picked_uid):
+    """
+    Mark the chosen card as picked=TRUE in the Rounds sheet for this draft.
+    """
+    sh, drafts_ws, rounds_ws = get_draft_sheet()
+    if rounds_ws is None:
+        return  # Sheets not configured / unavailable
+
+    try:
+        all_values = rounds_ws.get_all_values()
+        if not all_values:
+            return
+
+        header = all_values[0]
+
+        def col_idx(col_name):
+            return header.index(col_name) + 1  # 1-based for gspread
+
+        draft_idx = col_idx("draft_id")
+        player_idx = col_idx("player_name")
+        round_idx = col_idx("round")
+        uid_idx = col_idx("unique_id")
+        picked_idx = col_idx("picked")
+
+        for row_num, row in enumerate(all_values[1:], start=2):
+            if (
+                row[draft_idx - 1] == str(draft_id) and
+                row[player_idx - 1] == str(player_name) and
+                row[round_idx - 1] == str(round_num) and
+                row[uid_idx - 1] == str(picked_uid)
+            ):
+                rounds_ws.update_cell(row_num, picked_idx, "TRUE")
+                break
+    except Exception as e:
+        if not st.session_state.get("gsheets_warning_shown", False):
+            st.session_state["gsheets_warning_shown"] = True
+            st.warning(f"Could not log pick to Google Sheets: {e}")
+
 
 # ---------- LOAD DATA ----------
 @st.cache(show_spinner=False)
@@ -134,6 +232,7 @@ def load_cards(csv_name):
     if missing:
         st.error(f"Missing columns in CSV: {missing}")
     return df
+
 
 cards = load_cards(CSV_NAME)
 
@@ -642,5 +741,3 @@ if st.button("Generate draft image for selected player"):
                 file_name=f"{selected_player['name'].replace(' ', '_')}_draft.png",
                 mime="image/png"
             )
-
-
