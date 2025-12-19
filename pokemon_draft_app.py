@@ -17,73 +17,33 @@ IMAGE_FOLDER = "card_images"  # folder next to this .py file
 
 os.makedirs(IMAGE_FOLDER, exist_ok=True)
 
-# ---------- GOOGLE SHEETS HELPERS ----------
+# ---------- GOOGLE SHEETS HELPERS (CLOUD-FIRST, USES st.secrets ONLY) ----------
 
 SCOPES = ["https://www.googleapis.com/auth/spreadsheets"]
-
-# Local fallback sheet ID (used when running on your own computer).
-# Replace this string with your actual sheet ID from the Google Sheets URL.
-LOCAL_SHEET_ID = "1OORWkcWkwixexnHElLj0BXUSw_BL840gu2zEPMXc8j8"
-
-
-def load_service_account_info():
-    """
-    Try to load service account info from Streamlit secrets (for the cloud app),
-    otherwise fall back to a local JSON file (for local testing).
-    """
-    # 1) Try Streamlit secrets (used on Streamlit Cloud)
-    try:
-        raw = st.secrets.get("gcp_service_account", None)
-    except Exception:
-        raw = None
-
-    if raw:
-        # In the Secrets UI we pasted the JSON text, so raw is a string
-        if isinstance(raw, str):
-            try:
-                return json.loads(raw)
-            except Exception:
-                pass
-        # If for some reason it's already a dict-like, try to convert
-        try:
-            return dict(raw)
-        except Exception:
-            pass
-
-    # 2) Fallback: local JSON file for your laptop
-    json_path = os.path.join(os.path.dirname(__file__), "gcp_service_account.json")
-    with open(json_path, "r") as f:
-        return json.load(f)
-
-
-def get_sheet_id():
-    """
-    Get the Google Sheet ID from secrets if available (cloud),
-    otherwise fall back to LOCAL_SHEET_ID (local).
-    """
-    sheet_id = None
-    try:
-        sheet_id = st.secrets.get("google_sheets_document_id", None)
-    except Exception:
-        sheet_id = None
-
-    if sheet_id:
-        return sheet_id
-
-    # Fallback for local testing
-    if LOCAL_SHEET_ID and LOCAL_SHEET_ID != "PUT_YOUR_SHEET_ID_HERE":
-        return LOCAL_SHEET_ID
-
-    # If we get here, we have no sheet ID configured
-    raise RuntimeError("No Google Sheet ID configured (neither secrets nor LOCAL_SHEET_ID).")
 
 
 def get_gsheet_client():
     """
-    Build a gspread client using either secrets (cloud) or local JSON file (local).
+    Build a gspread client using Streamlit secrets.
+    Intended for the deployed app (and will also work locally if you set secrets there).
     """
     try:
-        service_account_info = load_service_account_info()
+        # We expect a JSON string in gcp_service_account
+        raw = st.secrets["gcp_service_account"]
+    except Exception as e:
+        # No secrets configured -> no Sheets logging
+        if not st.session_state.get("gsheets_warning_shown", False):
+            st.session_state["gsheets_warning_shown"] = True
+            st.warning(f"Google Sheets secrets not configured; drafts will not be logged: {e}")
+        return None
+
+    try:
+        if isinstance(raw, str):
+            service_account_info = json.loads(raw)
+        else:
+            # In case st.secrets returns a dict-like already
+            service_account_info = dict(raw)
+
         credentials = Credentials.from_service_account_info(
             service_account_info,
             scopes=SCOPES,
@@ -103,7 +63,7 @@ def get_draft_sheet():
         return None, None, None
 
     try:
-        sheet_id = get_sheet_id()
+        sheet_id = st.secrets["google_sheets_document_id"]
         sh = client.open_by_key(sheet_id)
         drafts_ws = sh.worksheet("Drafts")
         rounds_ws = sh.worksheet("Rounds")
@@ -111,7 +71,7 @@ def get_draft_sheet():
     except Exception as e:
         if not st.session_state.get("gsheets_warning_shown", False):
             st.session_state["gsheets_warning_shown"] = True
-            st.warning(f"Could not open Google Sheet or worksheets: {e}")
+            st.warning(f"Could not open Google Sheet or worksheets; drafts will not be logged: {e}")
         return None, None, None
 
 
@@ -394,7 +354,7 @@ def generate_round_choices(player_index):
         chosen_rows = eligible.sample(3)
         choices = list(chosen_rows["Unique ID"].values)
 
-    # Log offers to Google Sheets
+    # Log offers to Google Sheets (non-fatal if it fails)
     draft_id = st.session_state.get("draft_id", "LOCAL-DRAFT")
     append_round_offers_to_sheet(draft_id, player["name"], round_num, choices)
 
