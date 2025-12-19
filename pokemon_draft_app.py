@@ -5,7 +5,7 @@ import math
 from io import BytesIO
 from PIL import Image
 import requests
-import json  # ok to keep even if lightly used
+import json
 import gspread
 from google.oauth2.service_account import Credentials
 from datetime import datetime, timezone
@@ -25,7 +25,7 @@ SCOPES = ["https://www.googleapis.com/auth/spreadsheets"]
 def get_gsheet_client():
     """
     Build a gspread client using Streamlit secrets.
-    Expects [gcp_service_account] as a table in secrets.toml (so st.secrets['gcp_service_account'] is dict-like).
+    Expects [gcp_service_account] as a table in secrets (so st.secrets['gcp_service_account'] is dict-like).
     """
     try:
         service_account_info = dict(st.secrets["gcp_service_account"])
@@ -195,11 +195,15 @@ def load_cards(csv_name):
 
 cards = load_cards(CSV_NAME)
 
+# Map from string Unique ID to canonical value (to keep types consistent)
+UNIQUE_ID_MAP = {str(u): u for u in cards["Unique ID"].unique()}
+
+
 # ---------- GLOBAL STATE INITIALIZATION ----------
 if "initialized" not in st.session_state:
     st.session_state.initialized = True
 
-    # Global remaining Count per Unique ID
+    # Global remaining Count per Unique ID (fresh, before any draft is applied)
     st.session_state.global_counts = {}
     for _, row in cards.iterrows():
         uid = row["Unique ID"]
@@ -222,6 +226,10 @@ if "initialized" not in st.session_state:
                 "current_choices": None, # list of 3 Unique IDs for the current round
             }
         )
+
+    # Track which draft_id we've already loaded from Sheets
+    st.session_state.loaded_draft_id = None
+
 
 # ---------- HELPER: ROUND RULES ----------
 def get_round_info(round_num):
@@ -249,6 +257,7 @@ def get_round_info(round_num):
     else:
         return None
 
+
 # ---------- HELPER: IMAGE SOURCE ----------
 def get_card_image_source(unique_id, card_name, image_url):
     """
@@ -267,6 +276,204 @@ def get_card_image_source(unique_id, card_name, image_url):
         return image_url.strip()
     else:
         return None
+
+
+# ---------- HELPER: LOAD STATE FROM SHEETS FOR ASYNC DRAFT ----------
+def load_draft_state_from_sheets(draft_id: str) -> bool:
+    """
+    If the given draft_id exists in Google Sheets, rebuild session state from it:
+    - Set player names from Drafts sheet
+    - Recompute global_counts for this draft (based on offers)
+    - Rebuild each player's seen_ids, picks, and current_round
+    - If a round was offered but not picked yet, re-use those offers as current_choices
+    Returns True if a draft row exists (even if no rounds yet), False otherwise.
+    """
+    sh, drafts_ws, rounds_ws = get_draft_sheet()
+    if drafts_ws is None or rounds_ws is None:
+        return False
+
+    # ----- Look up draft row -----
+    draft_values = drafts_ws.get_all_values()
+    if len(draft_values) < 2:
+        return False  # only header, no drafts
+
+    draft_row = None
+    for row in draft_values[1:]:
+        if row and row[0] == str(draft_id):
+            draft_row = row
+            break
+
+    if draft_row is None:
+        return False  # no such draft_id yet
+
+    # Set player names from draft row: [draft_id, timestamp, status, p1, p2, p3, config_json]
+    names = draft_row[3:6]  # p1, p2, p3
+    for i in range(3):
+        name = names[i] if i < len(names) and names[i] else f"Player {i + 1}"
+        st.session_state.players[i]["name"] = name
+
+    # ----- Process Rounds sheet -----
+    rounds_values = rounds_ws.get_all_values()
+    if len(rounds_values) < 2:
+        # Draft exists but has no rounds yet; keep defaults
+        return True
+
+    header = rounds_values[0]
+
+    def col_idx(col_name: str) -> int:
+        return header.index(col_name)
+
+    try:
+        draft_col = col_idx("draft_id")
+        player_col = col_idx("player_name")
+        round_col = col_idx("round")
+        uid_col = col_idx("unique_id")
+        offered_col = col_idx("offered")
+        picked_col = col_idx("picked")
+    except ValueError:
+        # Header mismatch; don't crash the app
+        return True
+
+    relevant_rows = [
+        row for row in rounds_values[1:]
+        if len(row) > draft_col and row[draft_col] == str(draft_id)
+    ]
+
+    if not relevant_rows:
+        # Draft exists but no rounds yet
+        return True
+
+    # ----- Recompute global_counts based on offers so far -----
+    total_counts = {}
+    for _, row in cards.iterrows():
+        uid = row["Unique ID"]
+        cnt = int(row.get("Count", 0))
+        total_counts[uid] = total_counts.get(uid, 0) + cnt
+
+    offers_per_uid = {}
+    for row in relevant_rows:
+        if len(row) <= offered_col:
+            continue
+        offered_val = row[offered_col].strip().upper()
+        if offered_val == "TRUE":
+            uid_str = row[uid_col]
+            uid_val = UNIQUE_ID_MAP.get(uid_str, uid_str)
+            offers_per_uid[uid_val] = offers_per_uid.get(uid_val, 0) + 1
+
+    new_global_counts = {}
+    for uid, total in total_counts.items():
+        used = offers_per_uid.get(uid, 0)
+        remaining = max(total - used, 0)
+        new_global_counts[uid] = remaining
+    st.session_state.global_counts = new_global_counts
+
+    # ----- Rebuild per-player info -----
+    per_player = {}
+    for row in relevant_rows:
+        if len(row) <= max(player_col, round_col, uid_col, offered_col, picked_col):
+            continue
+
+        p_name = row[player_col]
+        round_str = row[round_col]
+        uid_str = row[uid_col]
+        offered_val = row[offered_col].strip().upper()
+        picked_val = row[picked_col].strip().upper()
+
+        try:
+            rnum = int(round_str)
+        except ValueError:
+            continue
+
+        uid_val = UNIQUE_ID_MAP.get(uid_str, uid_str)
+
+        info = per_player.setdefault(
+            p_name,
+            {
+                "seen_ids": set(),
+                "offers": {},   # round -> list of uids
+                "picked": [],   # list of (round, uid)
+            },
+        )
+
+        if offered_val == "TRUE":
+            info["seen_ids"].add(uid_val)
+            info["offers"].setdefault(rnum, []).append(uid_val)
+
+        if picked_val == "TRUE":
+            info["picked"].append((rnum, uid_val))
+
+    # Compute max picked round and "pending" (offered but not picked) round per player
+    for p_name, info in per_player.items():
+        if info["picked"]:
+            max_picked_round = max(r for (r, _) in info["picked"])
+        else:
+            max_picked_round = 0
+
+        pending_round = None
+        for rnum in sorted(info["offers"].keys()):
+            if not any(pr == rnum for (pr, _) in info["picked"]):
+                pending_round = rnum  # keep last such round
+
+        info["max_picked_round"] = max_picked_round
+        info["pending_round"] = pending_round
+
+    # ----- Apply to session_state.players -----
+    for p_state in st.session_state.players:
+        name = p_state["name"]
+        info = per_player.get(
+            name,
+            {
+                "seen_ids": set(),
+                "offers": {},
+                "picked": [],
+                "max_picked_round": 0,
+                "pending_round": None,
+            },
+        )
+
+        # Seen IDs
+        p_state["seen_ids"] = info["seen_ids"]
+
+        # Picked IDs and picks (sorted by round)
+        sorted_picks = sorted(info["picked"], key=lambda t: t[0])
+        p_state["picked_ids"] = [uid for (_, uid) in sorted_picks]
+
+        picks_list = []
+        for rnum, uid in sorted_picks:
+            base = cards[cards["Unique ID"] == uid]
+            if base.empty:
+                continue
+            base_row = base.iloc[0]
+            picks_list.append(
+                {
+                    "Round": rnum,
+                    "Unique ID": base_row["Unique ID"],
+                    "Card Name": base_row["Card Name"],
+                    "Card Type": base_row["Card Type"],
+                    "Card Stage": base_row["Card Stage"],
+                    "Rarity": base_row["Rarity"],
+                    "Set": base_row.get("Set", ""),
+                    "Series": base_row.get("Series", ""),
+                }
+            )
+        p_state["picks"] = picks_list
+
+        # Determine current_round and current_choices
+        pending_round = info["pending_round"]
+        max_picked_round = info["max_picked_round"]
+
+        if pending_round is not None and pending_round in info["offers"]:
+            # There were offers for this round but no pick yet -> resume that round
+            p_state["current_round"] = pending_round
+            p_state["current_choices"] = info["offers"][pending_round]
+        else:
+            # No pending round -> next round after last picked
+            next_round = max_picked_round + 1 if max_picked_round > 0 else 1
+            p_state["current_round"] = next_round
+            p_state["current_choices"] = None
+
+    return True
+
 
 # ---------- HELPER: GENERATE CHOICES FOR A ROUND ----------
 def generate_round_choices(player_index):
@@ -359,6 +566,7 @@ def generate_round_choices(player_index):
 
     return choices
 
+
 # ---------- SIDEBAR: DRAFT + PLAYER SETUP ----------
 st.sidebar.header("Draft Setup")
 
@@ -368,6 +576,15 @@ if "draft_id" not in st.session_state:
 draft_id_input = st.sidebar.text_input("Draft ID", value=st.session_state.draft_id)
 draft_id = draft_id_input.strip() or st.session_state.draft_id
 st.session_state.draft_id = draft_id
+
+# Load from Sheets once per draft_id (for async resume)
+if (
+    "loaded_draft_id" not in st.session_state
+    or st.session_state.loaded_draft_id != draft_id
+):
+    load_draft_state_from_sheets(draft_id)
+    st.session_state.loaded_draft_id = draft_id
+
 st.sidebar.write(f"Using draft ID: `{draft_id}`")
 
 st.sidebar.header("Player Setup")
@@ -396,6 +613,7 @@ for i in range(3):
     )
     p["types"] = selected
 
+# Ensure the draft row exists (safe if it already does)
 ensure_draft_row(draft_id, st.session_state.players)
 
 if st.sidebar.button("Reset entire draft (all players & counts)"):
