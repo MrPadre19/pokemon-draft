@@ -1,3 +1,10 @@
+#### How to Run Streamlit app ####
+
+cd Desktop\pokemon_draft
+streamlit run pokemon_draft_app.py
+
+### 12.18 Update
+
 import streamlit as st
 import pandas as pd
 import os
@@ -21,25 +28,66 @@ os.makedirs(IMAGE_FOLDER, exist_ok=True)
 
 SCOPES = ["https://www.googleapis.com/auth/spreadsheets"]
 
+# Optional: local fallback sheet ID (for testing on your machine)
+LOCAL_SHEET_ID = "1OORWkcWkwixexnHElLj0BXUSw_BL840gu2zEPMXc8j8"  # or leave "" if you only want to use secrets
+
+
 def load_service_account_info():
     """
-    Try to load service account info from Streamlit secrets (for cloud),
+    Try to load service account info from Streamlit secrets (for the cloud app),
     otherwise fall back to a local JSON file (for local testing).
     """
-    # Try Streamlit secrets first (used on Streamlit Cloud)
+    # 1) Try Streamlit secrets (used on Streamlit Cloud)
     try:
         raw = st.secrets.get("gcp_service_account", None)
-        if raw:
-            return json.loads(raw)
     except Exception:
-        pass
+        raw = None
 
-    # Local JSON file fallback
+    if raw:
+        # In the Secrets UI we pasted the JSON text, so raw is a string
+        if isinstance(raw, str):
+            try:
+                return json.loads(raw)
+            except Exception:
+                pass
+        # If for some reason it's already a dict-like
+        try:
+            return dict(raw)
+        except Exception:
+            pass
+
+    # 2) Fallback: local JSON file for your laptop
     json_path = os.path.join(os.path.dirname(__file__), "gcp_service_account.json")
     with open(json_path, "r") as f:
         return json.load(f)
 
+
+def get_sheet_id():
+    """
+    Get the Google Sheet ID from secrets if available (cloud),
+    otherwise fall back to LOCAL_SHEET_ID (local).
+    """
+    sheet_id = None
+    try:
+        sheet_id = st.secrets.get("google_sheets_document_id", None)
+    except Exception:
+        sheet_id = None
+
+    if sheet_id:
+        return sheet_id
+
+    # Fallback for local testing
+    if LOCAL_SHEET_ID:
+        return LOCAL_SHEET_ID
+
+    # If we get here, we have no sheet ID configured
+    raise RuntimeError("No Google Sheet ID configured (neither secrets nor LOCAL_SHEET_ID).")
+
+
 def get_gsheet_client():
+    """
+    Build a gspread client using either secrets (cloud) or local JSON file (local).
+    """
     try:
         service_account_info = load_service_account_info()
         credentials = Credentials.from_service_account_info(
@@ -49,121 +97,30 @@ def get_gsheet_client():
         client = gspread.authorize(credentials)
         return client
     except Exception as e:
-        st.warning(f"Could not connect to Google Sheets (drafts will not be logged): {e}")
+        if not st.session_state.get("gsheets_warning_shown", False):
+            st.session_state["gsheets_warning_shown"] = True
+            st.warning(f"Could not connect to Google Sheets; drafts will not be logged: {e}")
         return None
+
 
 def get_draft_sheet():
     client = get_gsheet_client()
     if client is None:
         return None, None, None
 
-    # Try to get sheet ID from secrets first, otherwise use hardcoded value
-    sheet_id = None
     try:
-        sheet_id = st.secrets.get("google_sheets_document_id", None)
-    except Exception:
-        sheet_id = None
-
-    if sheet_id is None:
-        # Fallback: hardcode your sheet ID here for local testing
-        sheet_id = "1OORWkcWkwixexnHElLj0BXUSw_BL840gu2zEPMXc8j8"
-
-    try:
+        sheet_id = get_sheet_id()
         sh = client.open_by_key(sheet_id)
         drafts_ws = sh.worksheet("Drafts")
         rounds_ws = sh.worksheet("Rounds")
         return sh, drafts_ws, rounds_ws
     except Exception as e:
-        st.warning(f"Could not open Google Sheet or worksheets: {e}")
+        if not st.session_state.get("gsheets_warning_shown", False):
+            st.session_state["gsheets_warning_shown"] = True
+            st.warning(f"Could not open Google Sheet or worksheets: {e}")
         return None, None, None
 
-def ensure_draft_row(draft_id, players):
-    """
-    Ensure a row exists in the Drafts sheet for this draft_id.
-    If it doesn't exist, create it.
-    """
-    sh, drafts_ws, rounds_ws = get_draft_sheet()
-    if drafts_ws is None:
-        return  # Sheets not configured / unavailable
 
-    try:
-        all_values = drafts_ws.get_all_values()
-        existing_ids = [row[0] for row in all_values[1:]] if len(all_values) > 1 else []
-        if draft_id in existing_ids:
-            return
-
-        timestamp = datetime.now(timezone.utc).isoformat()
-        p1 = players[0]["name"] if len(players) > 0 else ""
-        p2 = players[1]["name"] if len(players) > 1 else ""
-        p3 = players[2]["name"] if len(players) > 2 else ""
-        config_json = "{}"  # placeholder for future config
-
-        drafts_ws.append_row(
-            [draft_id, timestamp, "active", p1, p2, p3, config_json]
-        )
-    except Exception as e:
-        st.warning(f"Could not ensure draft row in Google Sheets: {e}")
-
-def append_round_offers_to_sheet(draft_id, player_name, round_num, choices):
-    """
-    Log the 3 offered cards for a round into the Rounds sheet.
-    """
-    sh, drafts_ws, rounds_ws = get_draft_sheet()
-    if rounds_ws is None:
-        return  # Sheets not configured / unavailable
-
-    try:
-        timestamp = datetime.now(timezone.utc).isoformat()
-        rows = []
-        for idx, uid in enumerate(choices, start=1):
-            rows.append([
-                str(draft_id),
-                str(player_name),
-                int(round_num),
-                int(idx),
-                str(uid),
-                "TRUE",   # offered
-                "FALSE",  # picked (not yet)
-                timestamp
-            ])
-        rounds_ws.append_rows(rows)
-    except Exception as e:
-        st.warning(f"Could not log round offers to Google Sheets: {e}")
-
-def mark_pick_in_sheet(draft_id, player_name, round_num, picked_uid):
-    """
-    Mark the chosen card as picked=TRUE in the Rounds sheet for this draft.
-    """
-    sh, drafts_ws, rounds_ws = get_draft_sheet()
-    if rounds_ws is None:
-        return  # Sheets not configured / unavailable
-
-    try:
-        all_values = rounds_ws.get_all_values()
-        if not all_values:
-            return
-
-        header = all_values[0]
-        def col_idx(col_name):
-            return header.index(col_name) + 1  # 1-based for gspread
-
-        draft_idx = col_idx("draft_id")
-        player_idx = col_idx("player_name")
-        round_idx = col_idx("round")
-        uid_idx = col_idx("unique_id")
-        picked_idx = col_idx("picked")
-
-        for row_num, row in enumerate(all_values[1:], start=2):
-            if (
-                row[draft_idx-1] == str(draft_id) and
-                row[player_idx-1] == str(player_name) and
-                row[round_idx-1] == str(round_num) and
-                row[uid_idx-1] == str(picked_uid)
-            ):
-                rounds_ws.update_cell(row_num, picked_idx, "TRUE")
-                break
-    except Exception as e:
-        st.warning(f"Could not log pick to Google Sheets: {e}")
 
 # ---------- LOAD DATA ----------
 @st.cache(show_spinner=False)
@@ -692,4 +649,5 @@ if st.button("Generate draft image for selected player"):
                 file_name=f"{selected_player['name'].replace(' ', '_')}_draft.png",
                 mime="image/png"
             )
+
 
