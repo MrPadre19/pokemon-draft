@@ -5,7 +5,7 @@ import math
 from io import BytesIO
 from PIL import Image
 import requests
-import json
+import json  # ok to keep even if lightly used
 import gspread
 from google.oauth2.service_account import Credentials
 from datetime import datetime, timezone
@@ -17,7 +17,7 @@ IMAGE_FOLDER = "card_images"  # folder next to this .py file
 
 os.makedirs(IMAGE_FOLDER, exist_ok=True)
 
-# ---------- GOOGLE SHEETS HELPERS (CLOUD-FIRST, USES st.secrets ONLY) ----------
+# ---------- GOOGLE SHEETS HELPERS (USES st.secrets TABLE) ----------
 
 SCOPES = ["https://www.googleapis.com/auth/spreadsheets"]
 
@@ -25,25 +25,19 @@ SCOPES = ["https://www.googleapis.com/auth/spreadsheets"]
 def get_gsheet_client():
     """
     Build a gspread client using Streamlit secrets.
-    Intended for the deployed app (and will also work locally if you set secrets there).
+    Expects [gcp_service_account] as a table in secrets.toml (so st.secrets['gcp_service_account'] is dict-like).
     """
     try:
-        # We expect a JSON string in gcp_service_account
-        raw = st.secrets["gcp_service_account"]
+        service_account_info = dict(st.secrets["gcp_service_account"])
     except Exception as e:
-        # No secrets configured -> no Sheets logging
         if not st.session_state.get("gsheets_warning_shown", False):
             st.session_state["gsheets_warning_shown"] = True
-            st.warning(f"Google Sheets secrets not configured; drafts will not be logged: {e}")
+            st.warning(
+                f"Google Sheets secrets not configured; drafts will not be logged: {e}"
+            )
         return None
 
     try:
-        if isinstance(raw, str):
-            service_account_info = json.loads(raw)
-        else:
-            # In case st.secrets returns a dict-like already
-            service_account_info = dict(raw)
-
         credentials = Credentials.from_service_account_info(
             service_account_info,
             scopes=SCOPES,
@@ -53,7 +47,9 @@ def get_gsheet_client():
     except Exception as e:
         if not st.session_state.get("gsheets_warning_shown", False):
             st.session_state["gsheets_warning_shown"] = True
-            st.warning(f"Could not connect to Google Sheets; drafts will not be logged: {e}")
+            st.warning(
+                f"Could not connect to Google Sheets; drafts will not be logged: {e}"
+            )
         return None
 
 
@@ -71,7 +67,9 @@ def get_draft_sheet():
     except Exception as e:
         if not st.session_state.get("gsheets_warning_shown", False):
             st.session_state["gsheets_warning_shown"] = True
-            st.warning(f"Could not open Google Sheet or worksheets; drafts will not be logged: {e}")
+            st.warning(
+                f"Could not open Google Sheet or worksheets; drafts will not be logged: {e}"
+            )
         return None, None, None
 
 
@@ -82,7 +80,7 @@ def ensure_draft_row(draft_id, players):
     """
     sh, drafts_ws, rounds_ws = get_draft_sheet()
     if drafts_ws is None:
-        return  # Sheets not configured / unavailable
+        return
 
     try:
         all_values = drafts_ws.get_all_values()
@@ -111,22 +109,24 @@ def append_round_offers_to_sheet(draft_id, player_name, round_num, choices):
     """
     sh, drafts_ws, rounds_ws = get_draft_sheet()
     if rounds_ws is None:
-        return  # Sheets not configured / unavailable
+        return
 
     try:
         timestamp = datetime.now(timezone.utc).isoformat()
         rows = []
         for idx, uid in enumerate(choices, start=1):
-            rows.append([
-                str(draft_id),
-                str(player_name),
-                int(round_num),
-                int(idx),
-                str(uid),
-                "TRUE",   # offered
-                "FALSE",  # picked (not yet)
-                timestamp
-            ])
+            rows.append(
+                [
+                    str(draft_id),
+                    str(player_name),
+                    int(round_num),
+                    int(idx),
+                    str(uid),
+                    "TRUE",   # offered
+                    "FALSE",  # picked (not yet)
+                    timestamp,
+                ]
+            )
         rounds_ws.append_rows(rows)
     except Exception as e:
         if not st.session_state.get("gsheets_warning_shown", False):
@@ -140,7 +140,7 @@ def mark_pick_in_sheet(draft_id, player_name, round_num, picked_uid):
     """
     sh, drafts_ws, rounds_ws = get_draft_sheet()
     if rounds_ws is None:
-        return  # Sheets not configured / unavailable
+        return
 
     try:
         all_values = rounds_ws.get_all_values()
@@ -160,10 +160,10 @@ def mark_pick_in_sheet(draft_id, player_name, round_num, picked_uid):
 
         for row_num, row in enumerate(all_values[1:], start=2):
             if (
-                row[draft_idx - 1] == str(draft_id) and
-                row[player_idx - 1] == str(player_name) and
-                row[round_idx - 1] == str(round_num) and
-                row[uid_idx - 1] == str(picked_uid)
+                row[draft_idx - 1] == str(draft_id)
+                and row[player_idx - 1] == str(player_name)
+                and row[round_idx - 1] == str(round_num)
+                and row[uid_idx - 1] == str(picked_uid)
             ):
                 rounds_ws.update_cell(row_num, picked_idx, "TRUE")
                 break
@@ -177,7 +177,6 @@ def mark_pick_in_sheet(draft_id, player_name, round_num, picked_uid):
 @st.cache(show_spinner=False)
 def load_cards(csv_name):
     df = pd.read_csv(csv_name)
-    # Basic sanity: ensure required columns exist
     required_cols = [
         "Unique ID",
         "Card Name",
@@ -205,7 +204,9 @@ if "initialized" not in st.session_state:
     for _, row in cards.iterrows():
         uid = row["Unique ID"]
         cnt = int(row.get("Count", 0))
-        st.session_state.global_counts[uid] = st.session_state.global_counts.get(uid, 0) + cnt
+        st.session_state.global_counts[uid] = (
+            st.session_state.global_counts.get(uid, 0) + cnt
+        )
 
     # Player state: 3 players
     st.session_state.players = []
@@ -218,7 +219,7 @@ if "initialized" not in st.session_state:
                 "seen_ids": set(),       # Unique IDs this player has seen as options
                 "picked_ids": [],        # Unique IDs this player has drafted
                 "picks": [],             # list of dicts with card info
-                "current_choices": None  # list of 3 Unique IDs for the current round
+                "current_choices": None, # list of 3 Unique IDs for the current round
             }
         )
 
@@ -231,7 +232,6 @@ def get_round_info(round_num):
       - rarity: one of "RR", "R", "U", "C" (for pokemon mode), or None
       - trainer_stage: "Supporter", "Item", "Tool" (for trainer mode)
     """
-    # Rounds 1–25: Pokémon by rarity band + types
     if round_num == 1:
         return {"mode": "pokemon", "rarity": "RR", "trainer_stage": None}
     elif 2 <= round_num <= 5:
@@ -240,13 +240,10 @@ def get_round_info(round_num):
         return {"mode": "pokemon", "rarity": "U", "trainer_stage": None}
     elif 14 <= round_num <= 25:
         return {"mode": "pokemon", "rarity": "C", "trainer_stage": None}
-    # Rounds 26–33: Trainer Supporter
     elif 26 <= round_num <= 33:
         return {"mode": "trainer", "rarity": None, "trainer_stage": "Supporter"}
-    # Rounds 34–42: Trainer Item
     elif 34 <= round_num <= 42:
         return {"mode": "trainer", "rarity": None, "trainer_stage": "Item"}
-    # Rounds 43–45: Trainer Tool
     elif 43 <= round_num <= 45:
         return {"mode": "trainer", "rarity": None, "trainer_stage": "Tool"}
     else:
@@ -286,30 +283,27 @@ def generate_round_choices(player_index):
     choices = []
 
     if rules["mode"] == "pokemon":
-        # Need player's 3 types
         if len(player["types"]) != 3:
             st.warning("This player must select exactly 3 Pokémon types before drafting.")
             return None
 
         rarity = rules["rarity"]
-        type_slots = player["types"]  # [TypeA, TypeB, TypeC]
-
+        type_slots = player["types"]
         used_ids_in_round = set()
 
         for slot_type in type_slots:
-            # Pokémon definition: Card Type != Trainer and Card Stage in [Basic, Stage 1, Stage 2]
             mask = (
-                (cards["Card Type"] == slot_type) &
-                (cards["Rarity"] == rarity) &
-                (cards["Card Type"] != "Trainer") &
-                (cards["Card Stage"].isin(["Basic", "Stage 1", "Stage 2"]))
+                (cards["Card Type"] == slot_type)
+                & (cards["Rarity"] == rarity)
+                & (cards["Card Type"] != "Trainer")
+                & (cards["Card Stage"].isin(["Basic", "Stage 1", "Stage 2"]))
             )
 
             def can_use(uid):
                 return (
-                    uid not in seen_ids and
-                    uid not in used_ids_in_round and
-                    global_counts.get(uid, 0) > 0
+                    uid not in seen_ids
+                    and uid not in used_ids_in_round
+                    and global_counts.get(uid, 0) > 0
                 )
 
             eligible = cards[mask].copy()
@@ -331,14 +325,14 @@ def generate_round_choices(player_index):
         stage = rules["trainer_stage"]
 
         mask = (
-            (cards["Card Type"] == "Trainer") &
-            (cards["Card Stage"] == stage)
+            (cards["Card Type"] == "Trainer")
+            & (cards["Card Stage"] == stage)
         )
 
         def can_use(uid):
             return (
-                uid not in seen_ids and
-                global_counts.get(uid, 0) > 0
+                uid not in seen_ids
+                and global_counts.get(uid, 0) > 0
             )
 
         eligible = cards[mask].copy()
@@ -354,21 +348,20 @@ def generate_round_choices(player_index):
         chosen_rows = eligible.sample(3)
         choices = list(chosen_rows["Unique ID"].values)
 
-    # Log offers to Google Sheets (non-fatal if it fails)
     draft_id = st.session_state.get("draft_id", "LOCAL-DRAFT")
     append_round_offers_to_sheet(draft_id, player["name"], round_num, choices)
 
-    # Apply side effects: mark seen & decrement global counts
     for uid in choices:
         player["seen_ids"].add(uid)
-        st.session_state.global_counts[uid] = st.session_state.global_counts.get(uid, 0) - 1
+        st.session_state.global_counts[uid] = (
+            st.session_state.global_counts.get(uid, 0) - 1
+        )
 
     return choices
 
 # ---------- SIDEBAR: DRAFT + PLAYER SETUP ----------
 st.sidebar.header("Draft Setup")
 
-# Draft ID (for logging to Sheets / future async)
 if "draft_id" not in st.session_state:
     st.session_state.draft_id = f"DRAFT-{int(time.time())}"
 
@@ -381,21 +374,17 @@ st.sidebar.header("Player Setup")
 
 pokemon_types = [
     "Colorless", "Darkness", "Dragon", "Fairy", "Fighting",
-    "Fire", "Grass", "Lightning", "Metal", "Psychic", "Water"
+    "Fire", "Grass", "Lightning", "Metal", "Psychic", "Water",
 ]
 
 for i in range(3):
     p = st.session_state.players[i]
 
-    # Stable key for player name
     name_key = f"player_{i}_name"
     p["name"] = st.sidebar.text_input(
-        f"Player {i + 1} name",
-        value=p["name"],
-        key=name_key,
+        f"Player {i + 1} name", value=p["name"], key=name_key
     )
 
-    # Stable key for this player's type selection
     types_key = f"player_{i}_types"
     if types_key not in st.session_state:
         st.session_state[types_key] = p["types"] or []
@@ -405,10 +394,8 @@ for i in range(3):
         pokemon_types,
         key=types_key,
     )
-
     p["types"] = selected
 
-# Ensure this draft ID exists in the Drafts sheet (non-fatal if Sheets isn't configured)
 ensure_draft_row(draft_id, st.session_state.players)
 
 if st.sidebar.button("Reset entire draft (all players & counts)"):
@@ -449,7 +436,7 @@ player_names = [p["name"] for p in st.session_state.players]
 active_index = st.selectbox(
     "Active Player",
     options=list(range(3)),
-    format_func=lambda i: player_names[i]
+    format_func=lambda i: player_names[i],
 )
 
 player = st.session_state.players[active_index]
@@ -469,7 +456,6 @@ else:
             "to continue drafting Pokémon rounds."
         )
     else:
-        # Generate choices if none currently stored
         if player["current_choices"] is None:
             choices = generate_round_choices(active_index)
             player["current_choices"] = choices
@@ -477,14 +463,13 @@ else:
         choices = player["current_choices"]
 
         if choices is not None:
-            # Show choices
             st.write("Choose **one** of the following 3 cards:")
 
             choice_rows = cards[cards["Unique ID"].isin(choices)].copy()
-            # Keep same order as choices
-            choice_rows = choice_rows.set_index("Unique ID").loc[choices].reset_index()
+            choice_rows = (
+                choice_rows.set_index("Unique ID").loc[choices].reset_index()
+            )
 
-            # Build labels for radio button
             labels = []
             for _, row in choice_rows.iterrows():
                 uid = row["Unique ID"]
@@ -496,7 +481,6 @@ else:
 
             uid_order = list(choice_rows["Unique ID"].values)
 
-            # Optional: show images first, side by side in 3 columns
             show_images = st.checkbox("Show images for these choices", value=True)
 
             if show_images:
@@ -507,27 +491,24 @@ else:
                     img_src = get_card_image_source(
                         uid,
                         name,
-                        row.get("Image URL", None)
+                        row.get("Image URL", None),
                     )
                     with col:
                         if img_src:
-                            # Use width=245 so images display at roughly 245x342
                             st.image(
                                 img_src,
                                 width=245,
-                                caption=f"[{uid}] {name}"
+                                caption=f"[{uid}] {name}",
                             )
                         else:
                             st.write(f"[{uid}] {name}")
 
-            # Single radio group below the images to keep "pick one" logic clean
             selected_label = st.radio(
                 "Your pick:",
                 options=labels,
-                index=0 if labels else 0
+                index=0 if labels else 0,
             )
 
-            # Find the UID corresponding to the selected label
             selected_uid = None
             for uid, label in zip(uid_order, labels):
                 if label == selected_label:
@@ -535,25 +516,24 @@ else:
                     break
 
             if st.button("Confirm pick for this round"):
-                # Record pick in local state
                 picked_row = cards[cards["Unique ID"] == selected_uid].iloc[0]
                 player["picked_ids"].append(selected_uid)
-                player["picks"].append({
-                    "Round": round_num,
-                    "Unique ID": picked_row["Unique ID"],
-                    "Card Name": picked_row["Card Name"],
-                    "Card Type": picked_row["Card Type"],
-                    "Card Stage": picked_row["Card Stage"],
-                    "Rarity": picked_row["Rarity"],
-                    "Set": picked_row.get("Set", ""),
-                    "Series": picked_row.get("Series", "")
-                })
+                player["picks"].append(
+                    {
+                        "Round": round_num,
+                        "Unique ID": picked_row["Unique ID"],
+                        "Card Name": picked_row["Card Name"],
+                        "Card Type": picked_row["Card Type"],
+                        "Card Stage": picked_row["Card Stage"],
+                        "Rarity": picked_row["Rarity"],
+                        "Set": picked_row.get("Set", ""),
+                        "Series": picked_row.get("Series", ""),
+                    }
+                )
 
-                # Log pick to Google Sheets (non-fatal if it fails)
                 draft_id = st.session_state.get("draft_id", "LOCAL-DRAFT")
                 mark_pick_in_sheet(draft_id, player["name"], round_num, selected_uid)
 
-                # Advance round and clear current choices
                 player["current_round"] += 1
                 player["current_choices"] = None
 
@@ -593,7 +573,9 @@ if st.button("Prepare export CSV"):
             else:
                 base_row = base.iloc[0]
                 image_url = base_row.get("Image URL", None)
-                img_src = get_card_image_source(uid, base_row["Card Name"], image_url)
+                img_src = get_card_image_source(
+                    uid, base_row["Card Name"], image_url
+                )
 
             row = {
                 "Player": p["name"],
@@ -605,7 +587,7 @@ if st.button("Prepare export CSV"):
                 "Rarity": pick["Rarity"],
                 "Set": pick.get("Set", ""),
                 "Series": pick.get("Series", ""),
-                "Image Source": img_src if img_src else image_url
+                "Image Source": img_src if img_src else image_url,
             }
             export_rows.append(row)
 
@@ -618,7 +600,7 @@ if st.button("Prepare export CSV"):
             label="Download drafted cards as CSV",
             data=csv_data,
             file_name="pokemon_draft_results.csv",
-            mime="text/csv"
+            mime="text/csv",
         )
 
 # ---------- EXPORT DRAFT IMAGE ----------
@@ -628,7 +610,7 @@ st.header("Export Draft Image (Per Player)")
 selected_player_index = st.selectbox(
     "Select player for image export",
     options=list(range(3)),
-    format_func=lambda i: st.session_state.players[i]["name"]
+    format_func=lambda i: st.session_state.players[i]["name"],
 )
 
 selected_player = st.session_state.players[selected_player_index]
@@ -642,7 +624,6 @@ if st.button("Generate draft image for selected player"):
     if not selected_player["picks"]:
         st.info("This player has no drafted cards yet.")
     else:
-        # Collect images in the order of picks
         images = []
         for pick in selected_player["picks"]:
             uid = pick["Unique ID"]
@@ -672,7 +653,6 @@ if st.button("Generate draft image for selected player"):
         if not images:
             st.warning("No images could be loaded for this player's picks.")
         else:
-            # Make a grid: 9 columns, enough rows for all images
             cols = 9
             card_w, card_h = 245, 342
             rows = math.ceil(len(images) / cols)
@@ -688,9 +668,12 @@ if st.button("Generate draft image for selected player"):
                 y = row_idx * card_h
                 collage.paste(img, (x, y))
 
-            st.image(collage, caption=f"{selected_player['name']}'s drafted cards", use_column_width=True)
+            st.image(
+                collage,
+                caption=f"{selected_player['name']}'s drafted cards",
+                use_column_width=True,
+            )
 
-            # Offer download as PNG
             buf = BytesIO()
             collage.save(buf, format="PNG")
             buf.seek(0)
@@ -699,5 +682,5 @@ if st.button("Generate draft image for selected player"):
                 label="Download draft image as PNG",
                 data=buf,
                 file_name=f"{selected_player['name'].replace(' ', '_')}_draft.png",
-                mime="image/png"
+                mime="image/png",
             )
